@@ -44,6 +44,8 @@ jobs:
           # keystore-key-alias: 'your-key-alias'
           # keystore-key-password: ${{ secrets.KEYSTORE_KEY_PASSWORD }}
           # keystore-path: 'tools/buildtools/upload-key.keystore' # Optional: for custom keystore locations
+          # For store AAB add this:
+          # aab: true
 ```
 
 ## Inputs
@@ -55,6 +57,7 @@ jobs:
 | `validate-gradle-wrapper` | Whether to validate the Gradle wrapper   | No       | `true`             |
 | `setup-java`              | Whether to run actions/setup-java action | No       | `true`             |
 | `variant`                 | Build variant (debug/release)            | No       | `debug`            |
+| `aab`                     | Build Android App Bundle instead of APK  | No       | `false`            |
 | `sign`                    | Whether to sign the build with keystore  | No       | -                  |
 | `re-sign`                 | Re-sign the APK with new JS bundle       | No       | `false`            |
 | `keystore-file`           | Path to the keystore file                | No       | -                  |
@@ -66,6 +69,34 @@ jobs:
 | `keystore-path`           | where the keystore should be placed      | No       | `release.keystore` |
 | `rock-build-extra-params` | Extra parameters for rock build:android  | No       | -                  |
 | `comment-bot`             | Whether to comment PR with build link    | No       | `true`             |
+| `custom-identifier`       | Custom identifier used in artifact naming for re-sign and ad-hoc flows to distinguish builds with the same native fingerprint     | No       | -           |
+| `validate-elf-alignment`  | Validate 16KB ELF alignment of native libraries (Google Play compliance) | No       | `false`     |
+
+## Artifact Naming
+
+The action uses two distinct naming strategies for uploads:
+
+### ZIP Artifacts (native build caching)
+
+ZIP artifacts store the native build for reuse. The naming depends on the flow:
+
+- **Ad-hoc flow** (`ad-hoc: true`): ZIP name uses **fingerprint only** — `rock-android-{variant}-{fingerprint}`. One ZIP per fingerprint, shared across all builds with the same native code. Skipped if already uploaded.
+- **Non-ad-hoc re-sign flow** (e.g. `pull_request` with `re-sign: true`): ZIP name includes an **identifier** — `rock-android-{variant}-{identifier}-{fingerprint}`. Used as the distribution mechanism without adhoc builds.
+- **Regular builds** (no `re-sign`): ZIP name uses **fingerprint only** `rock-android-{variant}-{fingerprint}`
+
+### Ad-Hoc Artifacts (distribution to testers)
+
+When `ad-hoc: true`, distribution files (APK + `index.html`) are uploaded under a name that **always includes an identifier**: `rock-android-{variant}-{identifier}-{fingerprint}`. This ensures every uploaded adhoc build can point to unique distribution URL based on `{identifier}`, even when multiple builds share the same native fingerprint.
+
+### Identifier Priority
+
+The identifier distinguishes builds that share the same native fingerprint (e.g., concurrent builds from different branches).
+It is resolved in this order:
+1. `custom-identifier` input — explicit value provided by the caller (e.g., commit SHA of the head of the PR branch)
+2. PR number — automatically extracted from `pull_request` events
+3. Short commit SHA — 7-character fallback for push events and dispatches
+
+> **Note:** The identifier becomes part of artifact names and S3 paths. Allowed characters: `a-z`, `A-Z`, `0-9`, `-`, `.`, `_`. Commas are used internally as trait delimiters and converted to hyphens (e.g., `debug,42` → `debug-42`), so they must not appear in the identifier. Spaces, slashes, and shell metacharacters are also not allowed.
 
 ## Outputs
 
@@ -119,6 +150,27 @@ The following mappings are set:
 - `ROCK_UPLOAD_KEY_PASSWORD` ← `inputs.keystore-key-password`
 
 Both conventions are set simultaneously, so the action works with any existing build configuration.
+
+## ELF Alignment Validation
+
+When `validate-elf-alignment: true`, the action verifies that all native shared libraries (`.so` files) in the APK are 16KB page-size aligned, as required by [Google Play for Android 15+ devices](https://developer.android.com/guide/practices/page-sizes).
+
+The check runs **only on fresh builds** (not on cached/downloaded artifacts) and **before** re-signing or uploading. It performs two levels of verification:
+
+1. **Zip-level alignment** via `zipalign -P 16` — checks that `.so` entries are correctly aligned within the APK archive
+2. **ELF-level alignment** via `objdump` — inspects each shared library's LOAD segment to confirm `2**14` (16KB) or higher alignment
+
+The command only supports APK files. If the build produces an AAB, the step will fail with a clear error. If any 64-bit library (`arm64-v8a`, `x86_64`) is misaligned, the workflow fails with a list of affected libraries.
+
+Internally this uses `npx rock validate-elf-alignment`, which requires `objdump` available on the runner. `zipalign` from Android build-tools 35.0.0+ is optional but recommended for zip-level checks.
+
+```yaml
+- uses: callstackincubator/android@v3
+  with:
+    github-token: ${{ secrets.GITHUB_TOKEN }}
+    variant: 'release'
+    validate-elf-alignment: true
+```
 
 ## Prerequisites
 
